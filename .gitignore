@@ -8,3 +8,8 @@ data
 *_experiment*
 *.jsonl
 tokenizers
+*.txt
+*.log
+*.json
+*.csv
+*.tsv

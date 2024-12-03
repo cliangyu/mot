@@ -292,6 +292,8 @@ def train(args: TrainArgs):
                 torch.manual_seed(args.model.seed)
                 model.init_weights()
         check_model_value_range(model, range=10.0, std=1.0)
+        
+        print(model)
 
         # log model size
 

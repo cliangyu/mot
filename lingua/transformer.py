@@ -1,8 +1,8 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional, Union, Tuple
+from typing import Optional, Union, Tuple, List
 
 import torch
 from torch import nn
@@ -46,6 +46,11 @@ class BaseTransformerArgs:
     init_std_factor: str = "disabled"
 
     max_seqlen: int = 1024
+    
+    # MoT specific args
+    use_mot: bool = False
+    modalities: List[str] = field(default_factory=lambda: ["text", "image"])
+    attention_type: str = "mot"  # Can be "mot" or "mst"
 
 
 def cross_entropy(pred, target, **kwargs):
@@ -137,6 +142,47 @@ def apply_rotary_emb(
     xq_out = (xq_ * freqs_cis).sum(5).flatten(3)
     xk_out = (xk_ * freqs_cis).sum(5).flatten(3)
     return xq_out.type_as(xq), xk_out.type_as(xk)
+
+
+def apply_rotary_emb_flattened(
+    xq: torch.Tensor,
+    xk: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Apply rotary embeddings to flattened query and key tensors.
+
+    Args:
+        xq: Query tensor of shape [N, num_heads, head_dim].
+        xk: Key tensor of shape [N, num_heads, head_dim].
+        freqs_cis: Precomputed rotary embeddings of shape [max_seqlen, head_dim // 2, 2, 2].
+        positions: Token positions tensor of shape [N].
+
+    Returns:
+        Tuple of transformed xq and xk tensors.
+    """
+    N, num_heads, head_dim = xq.shape
+    head_dim_half = head_dim // 2
+
+    # Reshape xq and xk to [N, num_heads, head_dim_half, 2]
+    xq_ = xq.view(N, num_heads, head_dim_half, 2)
+    xk_ = xk.view(N, num_heads, head_dim_half, 2)
+
+    # Get freqs_cis for the positions
+    freqs_cis_pos = freqs_cis[positions]  # [N, head_dim_half, 2, 2]
+    # Expand freqs_cis_pos to [N, 1, head_dim_half, 2, 2] to match xq_
+    freqs_cis_pos = freqs_cis_pos.unsqueeze(1)  # [N, 1, head_dim_half, 2, 2]
+
+    # Perform complex multiplication (rotary embedding application)
+    xq_out = torch.einsum('n h d p, n h d p q -> n h d q', xq_, freqs_cis_pos)
+    xk_out = torch.einsum('n h d p, n h d p q -> n h d q', xk_, freqs_cis_pos)
+
+    # Flatten back to [N, num_heads, head_dim]
+    xq_out = xq_out.reshape(N, num_heads, head_dim)
+    xk_out = xk_out.reshape(N, num_heads, head_dim)
+
+    return xq_out, xk_out
 
 
 def causal_mask(b, h, q_idx, kv_idx):
@@ -538,6 +584,303 @@ class TransformerBlock(nn.Module):
         self.feed_forward.reset_parameters(init_std, factor)
         self.ffn_norm.reset_parameters()
 
+class MoTAttention(Attention):
+    def __init__(
+        self,
+        dim: int,
+        head_dim: int,
+        n_heads: int,
+        n_kv_heads: int,
+        rope_theta: float,
+        modalities: List[str],
+    ):
+        super().__init__(dim, head_dim, n_heads, n_kv_heads, rope_theta)
+        self.modalities = modalities
+
+        # Modality-specific Q, K, V projections
+        self.wq_m = nn.ModuleDict({
+            m: nn.Linear(dim, n_heads * head_dim, bias=False)
+            for m in modalities
+        })
+        self.wk_m = nn.ModuleDict({
+            m: nn.Linear(dim, n_kv_heads * head_dim, bias=False)
+            for m in modalities
+        })
+        self.wv_m = nn.ModuleDict({
+            m: nn.Linear(dim, n_kv_heads * head_dim, bias=False)
+            for m in modalities
+        })
+        self.wo_m = nn.ModuleDict({
+            m: nn.Linear(n_heads * head_dim, dim, bias=False)
+            for m in modalities
+        })
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        freq_cis: torch.Tensor,
+        modality_ids: torch.Tensor,
+        tok_idx: Optional[torch.Tensor] = None,
+        mask: Optional[Union[BlockMask, AttentionBias, str]] = None,
+        attn_impl: str = "sdpa",
+    ) -> torch.Tensor:
+        bsz, seq_len, dim = x.shape
+
+        # Create modality masks using a mapping from modality IDs to modality names
+        modality_ids = modality_ids.view(bsz, seq_len)
+        modality_id_to_name = {idx: m for idx, m in enumerate(self.modalities)}
+        modality_masks = {
+            m: (modality_ids == idx)
+            for idx, m in modality_id_to_name.items()
+        }
+
+        # Initialize tensors for Q, K, V
+        xq = torch.zeros(bsz, seq_len, self.n_heads, self.head_dim, device=x.device, dtype=x.dtype)
+        xk = torch.zeros(bsz, seq_len, self.n_kv_heads, self.head_dim, device=x.device, dtype=x.dtype)
+        xv = torch.zeros(bsz, seq_len, self.n_kv_heads, self.head_dim, device=x.device, dtype=x.dtype)
+
+        # Apply modality-specific projections
+        for modality, modality_mask in modality_masks.items():
+            if modality_mask.any():
+                indices = modality_mask.nonzero(as_tuple=True)
+                x_m = x[indices]
+                out_q = self.wq_m[modality](x_m)
+                out_k = self.wk_m[modality](x_m)
+                out_v = self.wv_m[modality](x_m)
+
+                # Reshape outputs
+                out_q = out_q.view(-1, self.n_heads, self.head_dim)
+                out_k = out_k.view(-1, self.n_kv_heads, self.head_dim)
+                out_v = out_v.view(-1, self.n_kv_heads, self.head_dim)
+
+                # Assign back to xq, xk, xv
+                xq[indices[0], indices[1]] = out_q
+                xk[indices[0], indices[1]] = out_k
+                xv[indices[0], indices[1]] = out_v
+
+        # Reshape for attention
+        xq = xq.view(bsz, seq_len, self.n_heads, self.head_dim)
+        xk = xk.view(bsz, seq_len, self.n_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seq_len, self.n_kv_heads, self.head_dim)
+
+        # Apply rotary embeddings
+        xq, xk = apply_rotary_emb(xq, xk, 1, freq_cis[0:seq_len])
+
+        if hasattr(self, "kv_cache"):
+            xk, xv = self.kv_cache.update(xk, xv, tok_idx)
+
+        # Repeat keys and values if necessary
+        xk = repeat_kv(xk, self.heads_per_group, dim=2)
+        xv = repeat_kv(xv, self.heads_per_group, dim=2)
+
+        # Compute attention
+        if attn_impl == "flex_attention":
+            assert mask is None or isinstance(mask, BlockMask)
+            xq, xk, xv = map(lambda e: e.transpose(1, 2), (xq, xk, xv))
+            output = flex_attention_comp(xq, xk, xv, block_mask=mask)
+            output = output.transpose(1, 2).contiguous()
+        elif attn_impl == "fmha":
+            assert mask is None or isinstance(mask, AttentionBias)
+            output = fmha.memory_efficient_attention(xq, xk, xv, attn_bias=mask)
+        elif attn_impl == "sdpa":
+            xq, xk, xv = map(lambda e: e.transpose(1, 2), (xq, xk, xv))
+            is_causal = (mask == "causal") if isinstance(mask, str) else False
+            mask = mask if isinstance(mask, torch.Tensor) else None
+            output = F.scaled_dot_product_attention(
+                xq, xk, xv,
+                is_causal=is_causal,
+                attn_mask=mask,
+            )
+            output = output.transpose(1, 2).contiguous()
+        else:
+            raise NotImplementedError(f"Attention implementation {attn_impl} not supported")
+
+        # Reshape output and apply modality-specific output projections
+        output = output.view(bsz, seq_len, -1)
+        final_output = torch.zeros_like(output)
+        for modality, modality_mask in modality_masks.items():
+            if modality_mask.any():
+                indices = modality_mask.nonzero(as_tuple=True)
+                out_m = output[indices]
+                final_m = self.wo_m[modality](out_m)
+                final_output[indices[0], indices[1]] = final_m
+
+        return final_output
+
+
+class MoTFeedForward(FeedForward):
+    def __init__(
+        self,
+        dim: int,
+        hidden_dim: int,
+        multiple_of: int,
+        ffn_dim_multiplier: Optional[float],
+        modalities: List[str],
+        mp_size: int = 1,
+    ):
+        super().__init__(dim, hidden_dim, multiple_of, ffn_dim_multiplier, mp_size)
+        self.modalities = modalities
+
+        # Modality-specific FFN layers
+        self.w1_m = nn.ModuleDict({
+            m: nn.Linear(dim, self.hidden_dim, bias=False)
+            for m in modalities
+        })
+        self.w2_m = nn.ModuleDict({
+            m: nn.Linear(self.hidden_dim, dim, bias=False)
+            for m in modalities
+        })
+        self.w3_m = nn.ModuleDict({
+            m: nn.Linear(dim, self.hidden_dim, bias=False)
+            for m in modalities
+        })
+
+    def forward(self, x: torch.Tensor, modality_ids: torch.Tensor) -> torch.Tensor:
+        bsz, seq_len, dim = x.shape
+
+        # Create modality masks using a mapping from modality IDs to modality names
+        modality_ids = modality_ids.view(bsz, seq_len)
+        modality_id_to_name = {idx: m for idx, m in enumerate(self.modalities)}
+        modality_masks = {
+            m: (modality_ids == idx)
+            for idx, m in modality_id_to_name.items()
+        }
+
+        output = torch.zeros_like(x)
+        for modality, modality_mask in modality_masks.items():
+            if modality_mask.any():
+                indices = modality_mask.nonzero(as_tuple=True)
+                x_m = x[indices]
+                x1 = self.w1_m[modality](x_m)
+                x3 = self.w3_m[modality](x_m)
+                out_m = self.w2_m[modality](F.silu(x1) * x3)
+                output[indices[0], indices[1]] = out_m
+        return output
+
+
+class MoTTransformerBlock(TransformerBlock):
+    def __init__(self, args: BaseTransformerArgs):
+        super().__init__(args)
+        modalities = args.modalities or ['text', 'image']
+
+        # Replace attention and feed_forward with MoT versions
+        self.attention = MoTAttention(
+            dim=args.dim,
+            head_dim=self.head_dim,
+            n_heads=self.n_heads,
+            n_kv_heads=self.n_kv_heads,
+            rope_theta=args.rope_theta,
+            modalities=modalities,
+        )
+        self.feed_forward = MoTFeedForward(
+            dim=args.dim,
+            hidden_dim=4 * args.dim,
+            multiple_of=args.multiple_of,
+            ffn_dim_multiplier=args.ffn_dim_multiplier,
+            modalities=modalities,
+        )
+
+        # Modality-specific layer norms
+        self.attention_norm_m = nn.ModuleDict({
+            m: RMSNorm(args.dim, eps=args.norm_eps)
+            for m in modalities
+        })
+        self.ffn_norm_m = nn.ModuleDict({
+            m: RMSNorm(args.dim, eps=args.norm_eps)
+            for m in modalities
+        })
+        self.modalities = modalities  # Save modalities for use in forward method
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        freq_cis: torch.Tensor,
+        modality_ids: torch.Tensor,
+        tok_idx: Optional[torch.Tensor] = None,
+        mask: Optional[Union[BlockMask, AttentionBias, str]] = None,
+        attn_impl: str = "sdpa",
+    ) -> torch.Tensor:
+        bsz, seq_len, dim = x.shape
+
+        # Create modality masks using a mapping from modality IDs to modality names
+        modality_ids = modality_ids.view(bsz, seq_len)
+        modality_id_to_name = {idx: m for idx, m in enumerate(self.modalities)}
+        modality_masks = {
+            m: (modality_ids == idx)
+            for idx, m in modality_id_to_name.items()
+        }
+
+        # Apply modality-specific attention layer norms
+        x_norm = torch.zeros_like(x)
+        for modality, modality_mask in modality_masks.items():
+            if modality_mask.any():
+                indices = modality_mask.nonzero(as_tuple=True)
+                x_m = x[indices]
+                x_norm_m = self.attention_norm_m[modality](x_m)
+                x_norm[indices[0], indices[1]] = x_norm_m
+
+        # Apply attention
+        h = x + self.attention(
+            x_norm,
+            freq_cis,
+            modality_ids,
+            tok_idx=tok_idx,
+            mask=mask,
+            attn_impl=attn_impl,
+        )
+
+        # Apply modality-specific FFN layer norms
+        h_norm = torch.zeros_like(h)
+        for modality, modality_mask in modality_masks.items():
+            if modality_mask.any():
+                indices = modality_mask.nonzero(as_tuple=True)
+                h_m = h[indices]
+                h_norm_m = self.ffn_norm_m[modality](h_m)
+                h_norm[indices[0], indices[1]] = h_norm_m
+
+        # Apply feed-forward network
+        out = h + self.feed_forward(h_norm, modality_ids)
+        return out
+
+
+
+def check_modality_coverage(modality_masks: dict, seq_len: int, device: torch.device, batch_size: int = 1) -> bool:
+    """Check if modality masks cover the entire sequence exactly once (MECE rule).
+    
+    Args:
+        modality_masks: Dict of modality name to boolean mask tensor
+        seq_len: Expected sequence length
+        device: Device of the tensors
+        batch_size: Batch size for the masks
+        
+    Returns:
+        bool: True if masks are mutually exclusive and collectively exhaustive
+    """
+    # Sum all masks to check if each position is covered exactly once
+    total_mask = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=device)
+    
+    # For each modality mask, we only need the sequence dimension mask
+    # So we take [..., 0] to remove the model dimension
+    for mask in modality_masks.values():
+        # Remove the model dimension if it exists
+        if mask.ndim == 3:  # If shape is [batch, seq_len, model_dim]
+            mask = mask[..., 0]  # Take just [batch, seq_len]
+            
+        # Verify shapes match
+        if mask.shape != total_mask.shape:
+            raise ValueError(f"Mask shape {mask.shape} doesn't match expected shape {total_mask.shape}")
+            
+        # Check no overlap with existing mask
+        if (total_mask & mask).any():
+            raise ValueError("Modality masks overlap - not mutually exclusive")
+            
+        total_mask |= mask
+    
+    # Check all positions are covered
+    if not total_mask.all():
+        raise ValueError("Modality masks don't cover all positions - not collectively exhaustive")
+    
+    return True
 
 class BaseTransformer(nn.Module):
     def __init__(self, args: BaseTransformerArgs):
@@ -546,6 +889,10 @@ class BaseTransformer(nn.Module):
         self.init_base_std = args.init_base_std
         self.init_std_factor = InitStdFactor(args.init_std_factor)
         self.max_seqlen = args.max_seqlen
+        self.use_mot = args.use_mot
+        self.modalities = args.modalities
+        self.attention_type = args.attention_type
+        
         self.rope_embeddings = RotaryEmbedding(
             theta=args.rope_theta,
             head_dim=args.head_dim or args.dim // args.n_heads,
@@ -554,20 +901,26 @@ class BaseTransformer(nn.Module):
 
         self.layers = nn.ModuleList()
         for _ in range(args.n_layers):
-            self.layers.append(TransformerBlock(args))
-
+            if self.use_mot:
+                if args.attention_type == "mst":
+                    self.layers.append(MSTTransformerBlock(args))
+                else:
+                    self.layers.append(MoTTransformerBlock(args))
+            else:
+                self.layers.append(TransformerBlock(args))
     def forward(
         self,
         h,
         tok_idx: Optional[torch.Tensor] = None,
         mask: Optional[Union[BlockMask, AttentionBias, str]] = None,
         attn_impl: str = "sdpa",
+        modality_ids: Optional[torch.Tensor] = None,
     ):
 
         freq_cis = self.rope_embeddings(seqlen=self.max_seqlen, tok_idx=tok_idx)
 
         for i, layer in enumerate(self.layers):
-            h = layer(h, freq_cis, tok_idx=tok_idx, mask=mask, attn_impl=attn_impl)
+            h = layer(h, freq_cis, tok_idx=tok_idx, mask=mask, attn_impl=attn_impl, modality_ids=modality_ids)
         return h
 
     def reset_parameters(self):
@@ -585,3 +938,298 @@ class BaseTransformer(nn.Module):
             }[self.init_std_factor]
 
             layer.init_weights(self.init_base_std, factor)
+
+
+class MSTAttention(nn.Module):
+    """Multi-Stream Transformer Attention with fine-grained cross-modal and self-modal attention pathways."""
+
+    def __init__(
+        self,
+        dim: int,
+        head_dim: int,
+        n_heads: int,
+        n_kv_heads: int,
+        rope_theta: float,
+        modalities: List[str],
+    ):
+        super().__init__()
+        self.dim = dim
+        self.head_dim = head_dim
+        self.n_heads = n_heads
+        self.n_kv_heads = n_kv_heads
+        self.rope_theta = rope_theta
+        self.modalities = modalities
+        self.heads_per_group = self.n_heads // self.n_kv_heads
+
+        # Modality-specific query projections
+        self.wq_m = nn.ModuleDict({
+            m: nn.Linear(dim, n_heads * head_dim, bias=False)
+            for m in modalities
+        })
+
+        # Cross-modal and self-modal key and value projections
+        self.wk_m = nn.ModuleDict({
+            f"{src}_to_{tgt}": nn.Linear(dim, n_kv_heads * head_dim, bias=False)
+            for src in modalities
+            for tgt in modalities
+        })
+        self.wv_m = nn.ModuleDict({
+            f"{src}_to_{tgt}": nn.Linear(dim, n_kv_heads * head_dim, bias=False)
+            for src in modalities
+            for tgt in modalities
+        })
+
+        # Modality-specific output projections
+        self.wo_m = nn.ModuleDict({
+            m: nn.Linear(n_heads * head_dim, dim, bias=False)
+            for m in modalities
+        })
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        freq_cis: torch.Tensor,
+        modality_ids: torch.Tensor,
+        tok_idx: Optional[torch.Tensor] = None,
+        mask: Optional[Union[BlockMask, AttentionBias, str]] = None,
+        attn_impl: str = "sdpa",
+    ) -> torch.Tensor:
+        bsz, seq_len, dim = x.shape
+        N = bsz * seq_len  # Total number of tokens
+
+        # Create modality masks using a mapping from modality IDs to modality names
+        modality_ids = modality_ids.view(bsz, seq_len)
+        modality_id_to_name = {idx: m for idx, m in enumerate(self.modalities)}
+        modality_masks = {
+            m: (modality_ids == idx)
+            for idx, m in modality_id_to_name.items()
+        }
+
+        # If positions are not provided, use default positions
+        if tok_idx is not None:
+            positions = tok_idx.view(bsz, seq_len)
+        else:
+            positions = torch.arange(seq_len, device=x.device).unsqueeze(0).expand(bsz, -1)
+
+        # Initialize tensors for Q, K, V
+        xq = torch.zeros(N, self.n_heads, self.head_dim, device=x.device, dtype=x.dtype)
+        xk = torch.zeros(N, self.n_kv_heads, self.head_dim, device=x.device, dtype=x.dtype)
+        xv = torch.zeros(N, self.n_kv_heads, self.head_dim, device=x.device, dtype=x.dtype)
+        positions_all = torch.zeros(N, device=x.device, dtype=torch.long)
+
+        # Process queries for all target modalities
+        for tgt_idx, tgt_mod in modality_id_to_name.items():
+            tgt_mask = modality_masks[tgt_mod]
+            if not tgt_mask.any():
+                continue
+
+            tgt_indices = tgt_mask.nonzero(as_tuple=True)
+            flat_indices = tgt_indices[0] * seq_len + tgt_indices[1]
+            positions_q = positions[tgt_indices]
+
+            # Get queries for target modality
+            q = x[tgt_indices]  # Shape: [N_tgt, dim]
+            q = self.wq_m[tgt_mod](q)
+            q = q.view(-1, self.n_heads, self.head_dim)
+
+            # Assign to xq
+            xq[flat_indices] = q
+            positions_all[flat_indices] = positions_q.view(-1)
+
+        # Process keys and values for all source-target modality pairs
+        for src_idx, src_mod in modality_id_to_name.items():
+            src_mask = modality_masks[src_mod]
+            if not src_mask.any():
+                continue
+
+            src_indices = src_mask.nonzero(as_tuple=True)
+            flat_indices = src_indices[0] * seq_len + src_indices[1]
+            # positions_k = positions[src_indices]
+
+            src_tokens = x[src_indices]
+
+            # For each target modality, project keys and values
+            for tgt_idx, tgt_mod in modality_id_to_name.items():
+                kv_proj_key = f"{src_mod}_to_{tgt_mod}"
+
+                k = self.wk_m[kv_proj_key](src_tokens)
+                v = self.wv_m[kv_proj_key](src_tokens)
+
+                k = k.view(-1, self.n_kv_heads, self.head_dim)
+                v = v.view(-1, self.n_kv_heads, self.head_dim)
+
+                # Accumulate k and v for each flat_index
+                xk[flat_indices] += k
+                xv[flat_indices] += v
+
+        # Apply rotary embeddings to flattened tensors
+        xq, xk = apply_rotary_emb_flattened(xq, xk, freq_cis, positions_all)
+
+        # Reshape back to [bsz, seq_len, ...]
+        xq = xq.view(bsz, seq_len, self.n_heads, self.head_dim)
+        xk = xk.view(bsz, seq_len, self.n_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seq_len, self.n_kv_heads, self.head_dim)
+
+        # Repeat keys and values if necessary
+        xk = repeat_kv(xk, self.heads_per_group, dim=2)
+        xv = repeat_kv(xv, self.heads_per_group, dim=2)
+
+        # Prepare for attention computation
+        xq = xq.transpose(1, 2)  # B, n_heads, seq_len, head_dim
+        xk = xk.transpose(1, 2)  # B, n_heads, seq_len, head_dim
+        xv = xv.transpose(1, 2)  # B, n_heads, seq_len, head_dim
+
+        # Compute attention
+        if attn_impl == "sdpa":
+            is_causal = (mask == "causal") if isinstance(mask, str) else False
+            attn_mask = mask if isinstance(mask, torch.Tensor) else None
+            output = F.scaled_dot_product_attention(
+                xq, xk, xv, attn_mask=attn_mask, is_causal=is_causal
+            )  # B, n_heads, seq_len, head_dim
+            output = output.transpose(1, 2).contiguous()  # B, seq_len, n_heads, head_dim
+        else:
+            raise NotImplementedError(f"Attention implementation {attn_impl} not supported")
+
+        # Reshape output and apply modality-specific output projections
+        output = output.view(bsz * seq_len, -1)
+        final_output = torch.zeros_like(output)
+
+        # Apply modality-specific output projections
+        for tgt_idx, tgt_mod in modality_id_to_name.items():
+            tgt_mask = modality_masks[tgt_mod]
+            if tgt_mask.any():
+                tgt_indices = tgt_mask.nonzero(as_tuple=True)
+                flat_indices = tgt_indices[0] * seq_len + tgt_indices[1]
+                out_m = output[flat_indices]
+                final_m = self.wo_m[tgt_mod](out_m)
+                final_output[flat_indices] = final_m
+
+        final_output = final_output.view(bsz, seq_len, -1)
+
+        return final_output
+
+    def reset_parameters(self, init_std=None, factor=1.0):
+        init_std = init_std or (self.dim ** (-0.5))
+
+        # Initialize modality-specific projections
+        for m in self.modalities:
+            nn.init.trunc_normal_(
+                self.wq_m[m].weight,
+                mean=0.0,
+                std=init_std,
+                a=-3 * init_std,
+                b=3 * init_std,
+            )
+            nn.init.trunc_normal_(
+                self.wo_m[m].weight,
+                mean=0.0,
+                std=init_std / factor,
+                a=-3 * (init_std / factor),
+                b=3 * (init_std / factor),
+            )
+
+        # Initialize cross-modal projections
+        for key in self.wk_m.keys():
+            nn.init.trunc_normal_(
+                self.wk_m[key].weight,
+                mean=0.0,
+                std=init_std,
+                a=-3 * init_std,
+                b=3 * init_std,
+            )
+            nn.init.trunc_normal_(
+                self.wv_m[key].weight,
+                mean=0.0,
+                std=init_std,
+                a=-3 * init_std,
+                b=3 * init_std,
+            )
+            
+
+class MSTTransformerBlock(TransformerBlock):
+    """Multi-Stream Transformer Block with fine-grained cross-modal attention."""
+
+    def __init__(self, args: BaseTransformerArgs):
+        super().__init__(args)
+        modalities = args.modalities or ['text', 'image']
+        self.modalities = modalities
+
+        # Replace attention with MST attention
+        self.attention = MSTAttention(
+            dim=args.dim,
+            head_dim=self.head_dim,
+            n_heads=self.n_heads,
+            n_kv_heads=self.n_kv_heads,
+            rope_theta=args.rope_theta,
+            modalities=modalities,
+        )
+
+        # Use MoTFeedForward for modality-specific FFNs
+        self.feed_forward = MoTFeedForward(
+            dim=args.dim,
+            hidden_dim=4 * args.dim,
+            multiple_of=args.multiple_of,
+            ffn_dim_multiplier=args.ffn_dim_multiplier,
+            modalities=modalities,
+        )
+
+        # Modality-specific layer norms
+        self.attention_norm_m = nn.ModuleDict({
+            m: RMSNorm(args.dim, eps=args.norm_eps)
+            for m in modalities
+        })
+        self.ffn_norm_m = nn.ModuleDict({
+            m: RMSNorm(args.dim, eps=args.norm_eps)
+            for m in modalities
+        })
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        freq_cis: torch.Tensor,
+        modality_ids: torch.Tensor,
+        tok_idx: Optional[torch.Tensor] = None,
+        mask: Optional[Union[BlockMask, AttentionBias, str]] = None,
+        attn_impl: str = "sdpa",
+    ) -> torch.Tensor:
+        bsz, seq_len, dim = x.shape
+
+        # Create modality masks using a mapping from modality IDs to modality names
+        modality_ids = modality_ids.view(bsz, seq_len)
+        modality_id_to_name = {idx: m for idx, m in enumerate(self.modalities)}
+        modality_masks = {
+            m: (modality_ids == idx)
+            for idx, m in modality_id_to_name.items()
+        }
+
+        # Apply modality-specific attention layer norms
+        x_norm = torch.zeros_like(x)
+        for modality, modality_mask in modality_masks.items():
+            if modality_mask.any():
+                indices = modality_mask.nonzero(as_tuple=True)
+                x_m = x[indices]
+                x_norm_m = self.attention_norm_m[modality](x_m)
+                x_norm[indices[0], indices[1]] = x_norm_m
+
+        # Apply attention
+        h = x + self.attention(
+            x_norm,
+            freq_cis,
+            modality_ids,
+            tok_idx=tok_idx,
+            mask=mask,
+            attn_impl=attn_impl,
+        )
+
+        # Apply modality-specific FFN layer norms
+        h_norm = torch.zeros_like(h)
+        for modality, modality_mask in modality_masks.items():
+            if modality_mask.any():
+                indices = modality_mask.nonzero(as_tuple=True)
+                h_m = h[indices]
+                h_norm_m = self.ffn_norm_m[modality](h_m)
+                h_norm[indices[0], indices[1]] = h_norm_m
+
+        # Apply feed-forward network
+        out = h + self.feed_forward(h_norm, modality_ids)
+        return out

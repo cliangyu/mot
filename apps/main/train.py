@@ -73,6 +73,14 @@ logger = logging.getLogger()
 
 
 @dataclass
+class WandbArgs:
+    enabled: bool = False
+    project: str = "lingua"
+    name: Optional[str] = None
+    entity: Optional[str] = None
+
+
+@dataclass
 class TrainArgs:
     name: str = "lingua"
     dump_dir: str = ""
@@ -102,6 +110,8 @@ class TrainArgs:
     # If set to None, eval is run locally otherwise it launches a new job with the given number of gpus
     async_eval_gpus: Optional[int] = None
     eval: Optional[Any] = None
+
+    wandb: WandbArgs = field(default_factory=WandbArgs)
 
 
 @dataclass

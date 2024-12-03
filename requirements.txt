@@ -14,3 +14,6 @@ scipy
 pynvml
 datatrove
 orjson
+transformers>=4.36.0
+Pillow
+matplotlib

@@ -1,0 +1,52 @@
+dump_dir: ./mst_text_image_experiment
+name: "mst_text_image_training"
+steps: 50000
+
+seed: 42
+
+logging:
+    freq: 10
+    acc_freq: 1
+    wandb:
+        project: "lingua-mot"
+        name: "mst-text-image-mst"
+        entity: null
+
+optim:
+    lr: 3e-4
+    warmup: 4000
+    lr_min_ratio: 0.05
+    weight_decay: 0.1
+    clip: 1.0
+    beta1: 0.9
+    beta2: 0.95
+    epsilon: 1e-8
+    scheduler: "cosine"
+grad_acc_steps: 4
+
+distributed:
+    fsdp_type: full_shard
+    compile: true
+    selective_activation_checkpointing: true
+
+model:
+    dim: 1024
+    n_layers: 8
+    n_heads: 8
+    use_mot: true  # Use MoT architecture
+    modalities: ["text", "image"]
+    attention_type: "mst"  # Use MST attention variant
+
+data:
+    root_dir: data
+    sources:
+        image_tokens: 100.0
+    batch_size: 1
+    seq_len: 16384  # allows for 4 images of 4096 tokens each
+    load_async: true
+    n_views: 2
+    add_bos: false
+    add_eos: false
+    tokenizer:
+        name: "image"
+        vocab_size: 64772  # Tokens > 32004 are image tokens, <= 32004 are text tokens 

@@ -1,0 +1,40 @@
+dump_dir: ./blip3_experiment
+name: "blip3_training"
+steps: 10000
+
+seed: 42
+
+logging:
+    freq: 10
+    acc_freq: 1
+    wandb:
+        project: "lingua-blip3"
+        name: "blip3-training"
+        entity: null
+
+optim:
+    lr: 3e-4
+    warmup: 2000
+    lr_min_ratio: 0.000001
+    clip: 10.0
+
+distributed:
+    fsdp_type: full_shard
+    compile: true
+    selective_activation_checkpointing: false
+
+model:
+    dim: 1024
+    n_layers: 8
+    n_heads: 8
+
+data:
+    root_dir: data
+    sources:
+      blip3: 100.0
+    batch_size: 32
+    seq_len: 1024
+    load_async: true
+    tokenizer:
+        name: hf
+        path: meta-llama/Meta-Llama-3-8B 

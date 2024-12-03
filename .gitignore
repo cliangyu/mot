@@ -3,3 +3,8 @@
 *.ipynb
 slurm-*.out
 wandb
+
+data
+*_experiment*
+*.jsonl
+tokenizers

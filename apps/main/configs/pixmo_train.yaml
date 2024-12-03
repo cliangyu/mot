@@ -1,0 +1,41 @@
+dump_dir: ./pixmo_experiment
+name: "pixmo_training"
+steps: 10000
+
+seed: 42
+
+logging:
+    freq: 10
+    acc_freq: 1
+    wandb:
+        project: "lingua-pixmo"
+        name: "pixmo-training"
+        entity: null
+
+optim:
+    lr: 3e-4
+    warmup: 2000
+    lr_min_ratio: 0.000001
+    clip: 10.0
+grad_acc_steps: 4
+
+distributed:
+    fsdp_type: full_shard
+    compile: true
+    selective_activation_checkpointing: true
+
+model:
+    dim: 1024
+    n_layers: 8
+    n_heads: 8
+
+data:
+    root_dir: data
+    sources:
+      pixmo: 100.0
+    batch_size: 1
+    seq_len: 16384
+    load_async: true
+    tokenizer:
+        name: hf
+        path: meta-llama/Meta-Llama-3-8B

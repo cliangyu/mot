@@ -11,6 +11,7 @@ import os
 from sentencepiece import SentencePieceProcessor
 import tiktoken
 from tiktoken.load import load_tiktoken_bpe
+from transformers import AutoTokenizer
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +20,7 @@ logger = logging.getLogger(__name__)
 class TokenizerArgs:
     name: str = "bytes"
     path: Optional[str] = None
+    vocab_size: Optional[int] = None
 
 
 class Tokenizer(abc.ABC):
@@ -187,7 +189,84 @@ class TikTokenTokenizer(Tokenizer):
         return substrs, offsets
 
 
-def build_tokenizer(name: str, path: Optional[str] = None) -> Tokenizer:
+class HuggingFaceTokenizer(Tokenizer):
+    def __init__(self, model_path: str) -> None:
+        self.hf_tokenizer = AutoTokenizer.from_pretrained(model_path)
+        
+        logger.info(f"Loaded HuggingFace tokenizer from {model_path}")
+        
+        # Get special token IDs with fallbacks
+        self.bos_id: int = self.hf_tokenizer.bos_token_id
+        if self.bos_id is None:
+            logger.warning(f"No BOS token found in tokenizer, using default")
+            self.bos_id = 1
+            
+        self.eos_id: int = self.hf_tokenizer.eos_token_id
+        if self.eos_id is None:
+            logger.warning(f"No EOS token found in tokenizer, using default")
+            self.eos_id = 2
+            
+        self.pad_id: int = self.hf_tokenizer.pad_token_id
+        if self.pad_id is None:
+            logger.warning(f"No PAD token found in tokenizer, using EOS token")
+            self.pad_id = self.eos_id
+            
+        self.n_words: int = len(self.hf_tokenizer)
+        
+        logger.info(
+            f"#words: {self.n_words} - BOS ID: {self.bos_id} - EOS ID: {self.eos_id} - PAD ID: {self.pad_id}"
+        )
+
+    def encode(self, s: str, add_bos: bool, add_eos: bool) -> List[int]:
+        assert isinstance(s, str)
+        # Use the tokenizer's built-in special token handling
+        tokens = self.hf_tokenizer.encode(
+            s,
+            add_special_tokens=False,
+            return_tensors=None
+        )
+        return [self.bos_id] * add_bos + tokens + [self.eos_id] * add_eos
+
+    def decode(self, tokens: List[int]) -> str:
+        return self.hf_tokenizer.decode(tokens, skip_special_tokens=True)
+
+    def get_token_offsets(
+        self, text: str, tokens: Optional[List[int]] = None
+    ) -> Tuple[List[str], List[int]]:
+        encoded = self.hf_tokenizer.encode_plus(
+            text,
+            return_offsets_mapping=True,
+            add_special_tokens=False
+        )
+        
+        offsets = encoded["offset_mapping"]
+        substrs = [text[start:end] for start, end in offsets]
+        start_offsets = [start for start, _ in offsets]
+        
+        return substrs, start_offsets
+
+
+class ImageTokenizer(Tokenizer):
+    """A mock tokenizer for image tokens that just returns the vocabulary size."""
+    def __init__(self, vocab_size: int = 32768):
+        self.n_words = vocab_size
+        self.bos_id = None  # No BOS token for image tokens
+        self.eos_id = None  # No EOS token for image tokens
+        
+    def encode(self, tokens, add_bos: bool = False, add_eos: bool = False):
+        """Image tokens are already encoded, so just return them as is."""
+        return tokens
+        
+    def decode(self, tokens):
+        """Not implemented for image tokens."""
+        raise NotImplementedError("Decoding not supported for image tokens")
+        
+    def get_token_offsets(self, text: str, tokens: Optional[List[int]] = None):
+        """Not implemented for image tokens."""
+        raise NotImplementedError("Token offsets not supported for image tokens")
+
+
+def build_tokenizer(name: str, path: Optional[str] = None, vocab_size: Optional[int] = None) -> Tokenizer:
     if name == "bytes":
         return ByteTokenizer()
     elif name == "mock":
@@ -196,5 +275,9 @@ def build_tokenizer(name: str, path: Optional[str] = None) -> Tokenizer:
         return SentencePieceTokenizer(path)
     elif name == "tiktoken":
         return TikTokenTokenizer(path)
+    elif name == "hf":
+        return HuggingFaceTokenizer(path)
+    elif name == "image":
+        return ImageTokenizer(vocab_size or 32768)
     else:
         raise NotImplementedError(f"{name} tokenizer type is not implemented")

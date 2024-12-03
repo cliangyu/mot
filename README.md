@@ -43,6 +43,18 @@ python -m lingua.stool script=apps.main.train config=apps/main/configs/debug.yam
 torchrun --nproc-per-node 8 -m apps.main.train config=apps/main/configs/debug.yaml
 # or you can also launch on 1 GPU
 python -m apps.main.train config=apps/main/configs/debug.yaml
+
+
+# Pixmo
+torchrun --nproc-per-node 4 -m apps.main.train config=apps/main/configs/pixmo_train.yaml
+CUDA_VISIBLE_DEVICES=2,3 torchrun --nproc-per-node 2 -m apps.main.train config=apps/main/configs/pixmo_train.yaml
+torchrun --nproc-per-node 4 -m apps.main.train config=apps/main/configs/image_token_train.yaml
+
+# MST
+torchrun --nproc-per-node 4 --master_port 29501 -m apps.main.train config=apps/main/configs/mst_text_image_train.yaml
+# MoT
+torchrun --nproc-per-node 4 --master_port 29502 -m apps.main.train config=apps/main/configs/mot_text_image_train.yaml
+
 ```
 
 When using `stool`, if a job crashes, it can be relaunched using sbatch:
@@ -343,3 +355,11 @@ We believe this targeted approach helps researchers make progress faster without
 ## License
 
 Meta Lingua is licensed under BSD-3-Clause license. Refer to the LICENSE file in the top level directory.
+
+
+
+# TODO
+1. Image VQ token training
+2. Dataloader for concatenation of text and image tokens
+3. Implement MoT
+4. Implement improved attention

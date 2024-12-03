@@ -15,6 +15,7 @@ from typing import Dict, Any, Iterator, Optional, TypedDict
 from lingua.tokenizer import build_tokenizer, TokenizerArgs
 import numpy as np
 import logging
+from lingua.image_data import image_token_iterator
 
 logger = logging.getLogger()
 
@@ -215,9 +216,12 @@ def tokenize(
 ):
     """
     Tokenizes text from an iterator of content-state pairs using a specified tokenizer.
+    For image tokens, passes through the tokens directly.
 
     Parameters:
-    - iterator: An iterable of (content, state) pairs where content is a dict with a 'text' or 'content' key.
+    - iterator: An iterable of (content, state) pairs where content is a dict with either:
+        - 'text' or 'content' key for text data
+        - 'tokens' key for image token data
     - tokenizer: Tokenizer object with an `encode` method to convert text to tokens, supporting `add_bos` and `add_eos`.
     - add_bos (bool): Flag to add a beginning-of-sequence token.
     - add_eos (bool): Flag to add an end-of-sequence token.
@@ -227,12 +231,16 @@ def tokenize(
     """
     tokenizer = build_tokenizer(name=tokenizer_type, path=tokenizer_path)
     for content, state in iterator:
-        assert (
-            "text" in content or "content" in content
-        ), "JSON line must contain either text or content key"
-        content_key = "text" if ("text" in content) else "content"
-        text = content[content_key]
-        tokens = tokenizer.encode(text, add_bos=add_bos, add_eos=add_eos)
+        if "tokens" in content:  # Handle image tokens
+            tokens = content["tokens"]
+        else:  # Handle text data
+            assert (
+                "text" in content or "content" in content
+            ), "JSON line must contain either text, content, or tokens key"
+            content_key = "text" if ("text" in content) else "content"
+            text = content[content_key]
+            tokens = tokenizer.encode(text, add_bos=add_bos, add_eos=add_eos)
+        
         yield tokens, TokenizerState(
             it_state=state,
             add_bos=add_bos,
@@ -242,6 +250,29 @@ def tokenize(
         )
 
 
+def setup_sources(multi_state):
+    path_to_iter = dict()
+    for source in multi_state["sources"]:
+        jsonl_state = multi_state["source_to_state"][source]
+        if source == "image_tokens":
+            path_to_iter[source] = image_token_iterator(
+                jsonl_state["file_path"],
+                jsonl_state["position"],
+                jsonl_state["block_size"],
+                jsonl_state["offset"],
+            )
+        else:
+            path_to_iter[source] = loop_on_jsonl(
+                jsonl_state["file_path"],
+                jsonl_state["position"],
+                jsonl_state["block_size"],
+                jsonl_state["offset"],
+                jsonl_state["current_iter"],
+            )
+
+    return path_to_iter
+
+
 def choose_source(
     source_to_iterator: Dict[str, Iterator],
     source_to_state: Dict[str, Any],
@@ -249,43 +280,34 @@ def choose_source(
     sources: Dict[str, float],
     rng_state: Dict[str, Any],
 ):
-    """
-    Iterates over multiple data sources, selecting sequences based on weighted random choice.
-
-    Parameters:
-    - source_to_iterator (Dict[str, Iterator]): Dict from source paths to their iterators.
-    - source_to_state (Dict[str, State]): Initial state for each source, allowing state tracking.
-    - root_dir str: Root dir of data sources
-    - sources Dict[str, float]: Dict from subdirectory to the weight used for sampling
-    - rng_state (dict): State of the random number generator for reproducibility.
-
-    Yields:
-    - Tuple of (seq, multi_choice_state) where `seq` is the next sequence from the chosen source,
-    and `multi_choice_state` includes the current state of all sources and the RNG.
-
-    This function ensures that sequences are chosen from the provided sources based on the specified weights,
-    maintaining state information for each source and the RNG to allow for reproducible iteration.
-    """
-    n_sources = len(sources)
+    """Choose a source according to weights and yield from its iterator."""
     possible_sources = list(sources.keys())
-    weights = list(sources.values())
+    weights = [sources[k] for k in possible_sources]
+    n_sources = len(possible_sources)
+
     # We create the rng and set its state
     rng = np.random.default_rng()
     rng.bit_generator.state = rng_state
     while True:
-        # We save the rng state before sampling to be able to yield the same sequence on reload
         norm_weights = np.array(weights) / np.array(weights).sum()
         source_choice = possible_sources[rng.choice(n_sources, p=norm_weights)]
-        seq, state = next(source_to_iterator[source_choice])
+        
+        # Get next item from the chosen source
+        content, state = next(source_to_iterator[source_choice])
+        
+        # For image tokens, wrap the tokens in a dict with "tokens" key
+        if source_choice == "image_tokens" and isinstance(content, dict) and "tokens" in content:
+            tokens = content["tokens"]
+            content = {"tokens": tokens}
+        
         source_to_state = {**source_to_state, source_choice: state}
-        # We update the corresponding source state
         multi_choice_state = MultiChoiceState(
             root_dir=root_dir,
             sources=sources,
             source_to_state=source_to_state,
             rng_state=rng.bit_generator.state,
         )
-        yield seq, multi_choice_state
+        yield content, multi_choice_state
 
 
 def get_empty_buffer_state(
@@ -476,36 +498,37 @@ def find_and_sanitize_chunks(dataset_path: str, world_size: int, file_pattern: s
     else:
         assert (
             world_size % n_chunks == 0
-        ), "World size should be a multiple of number of chunks"
+        ), f"World size should be a multiple of number of chunks, {world_size} % {n_chunks} != 0"
 
     assert n_chunks > 0, f"No valid chunks in {dataset_path}"
 
     return dataset_chunks
 
 
-def distribute_data_to_rank(dataset_path: str, rank: int, world_size: int, file_pattern: str):
-    """
-    Distributes the chunk files in a dataset path to each worker.
-    If world_size is smaller than the number of chunks, the extra chunks are discarded.
-    Otherwise, world_size is assumed to be a multiple of number of chunks.
-    In that case there are world_size//nb_chunks workers on each chunk file, reading with different offsets.
-    """
-    dataset_chunks = find_and_sanitize_chunks(dataset_path, world_size, file_pattern)
-    n_ranks_per_chunk = world_size // len(dataset_chunks)
-    rank_to_jsonl_iterator_params = []
-    for chunk_path in dataset_chunks:
-        for i in range(n_ranks_per_chunk):
-            rank_to_jsonl_iterator_params.append(
-                JSONLState(
-                    file_path=chunk_path,
-                    position=0,
-                    block_size=n_ranks_per_chunk,
-                    offset=i,
-                    current_iter=0,
-                )
-            )
-
-    return rank_to_jsonl_iterator_params[rank]
+def distribute_data_to_rank(data_path: str, rank: int, world_size: int, file_pattern: str = TRAIN_DATA_FILE_PATTERN):
+    """Distribute data files to ranks."""
+    if data_path.endswith('.jsonl'):  # Handle direct JSONL file (for image tokens)
+        return {
+            "file_path": data_path,
+            "position": 0,
+            "block_size": world_size,
+            "offset": rank,
+            "current_iter": 0,
+        }
+    
+    # Original code for chunked files
+    data_dir = Path(data_path)
+    files = sorted(data_dir.glob(file_pattern))
+    assert len(files) > 0, f"No files found in {data_dir} with pattern {file_pattern}"
+    rank_files = [f for i, f in enumerate(files) if i % world_size == rank]
+    assert len(rank_files) > 0, f"No files assigned to rank {rank}"
+    return {
+        "file_path": str(rank_files[0]),
+        "position": 0,
+        "block_size": 1,
+        "offset": 0,
+        "current_iter": 0,
+    }
 
 
 def init_choice_state(
@@ -581,21 +604,6 @@ def init_state(
         batch_size=batch_size,
         prefetch_size=prefetch_size,
     )
-
-
-def setup_sources(multi_state):
-    path_to_iter = dict()
-    for source in multi_state["sources"]:
-        jsonl_state = multi_state["source_to_state"][source]
-        path_to_iter[source] = loop_on_jsonl(
-            jsonl_state["file_path"],
-            jsonl_state["position"],
-            jsonl_state["block_size"],
-            jsonl_state["offset"],
-            jsonl_state["current_iter"],
-        )
-
-    return path_to_iter
 
 
 @contextlib.contextmanager
@@ -720,6 +728,7 @@ class DataArgs:
     load_async: bool = True
     prefetch_size: int = 64
     tokenizer: TokenizerArgs = field(default_factory=TokenizerArgs)
+    image_token_path: Optional[str] = None  # Path to image tokens JSONL file
 
 
 def init_dataloader_state_from_args(

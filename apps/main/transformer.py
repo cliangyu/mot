@@ -98,8 +98,11 @@ class LMTransformer(BaseTransformer):
         tok_idx: Optional[torch.Tensor] = None,
         mask: Optional[Union[BlockMask, AttentionBias, torch.Tensor, str]] = None,
         attn_impl: str = "sdpa",
+        modality_ids: Optional[torch.Tensor] = None,
     ):
         bsz, seqlen = token_values.shape
+        
+        modality_ids = get_modality_from_token_id(token_values)
 
         h = self.tok_embeddings(token_values)
 
@@ -109,7 +112,7 @@ class LMTransformer(BaseTransformer):
             else create_causal_mask(seqlen, attn_impl, self.sliding_window)
         )
 
-        h = super().forward(h, tok_idx=tok_idx, mask=mask, attn_impl=attn_impl)
+        h = super().forward(h, tok_idx=tok_idx, modality_ids=modality_ids, mask=mask, attn_impl=attn_impl)
 
         logits = self.output(self.norm(h))
         if target is not None:
@@ -218,3 +221,19 @@ def tp_parallelize(model, tp_mesh, model_args: LMTransformerArgs, distributed_ar
         attn_layer = layer.attention
         attn_layer.n_heads = attn_layer.n_heads // distributed_args.tp_size
         attn_layer.n_kv_heads = attn_layer.n_kv_heads // distributed_args.tp_size
+
+def get_modality_from_token_id(token_id: torch.Tensor) -> torch.Tensor:
+    """Convert token IDs to modality IDs based on token value thresholds.
+    
+    Args:
+        token_id: Tensor of token IDs
+        
+    Returns:
+        Tensor of modality strings ('text' or 'image')
+    """
+    # Create tensor of same shape as token_id on same device
+    modality_ids = torch.empty_like(token_id, dtype=torch.long, device=token_id.device)
+    # Use 0 for text, 1 for image
+    modality_ids.fill_(0)  # Default to text
+    modality_ids[token_id > 32004] = 1  # Image tokens
+    return modality_ids

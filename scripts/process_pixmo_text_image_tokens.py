@@ -24,7 +24,7 @@ def process_tokens(output_dir, nchunks=32, seed=42):
     min_token_id = float('inf')
     token_counts = {}
     
-    input_file = "pixmo_cap_tokens.jsonl"
+    input_file = "/home/ly/d/code/lingua/pixmo_cap_tokens.jsonl"
     print(f"Reading from {input_file}")
     
     with open(input_file, "r") as f:

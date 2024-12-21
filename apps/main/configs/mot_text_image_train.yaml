@@ -1,4 +1,4 @@
-dump_dir: ./mot_text_image_experiment_3
+dump_dir: ./mot_text_image_experiment_2
 name: "mot_text_image_training"
 steps: 50000
 
@@ -30,10 +30,10 @@ distributed:
     selective_activation_checkpointing: true
 
 model:
-    dim: 1024
+    dim: 256
     n_layers: 8
     n_heads: 8
-    use_mot: true  # Enable MoT architecture
+    use_mot: false  # Enable MoT architecture
     # modalities will use default ["text", "image"] from BaseTransformerArgs
 
 data:
@@ -41,7 +41,7 @@ data:
     sources:
         image_tokens: 100.0
     batch_size: 1
-    seq_len: 16384  # allows for 4 images of 4096 tokens each
+    seq_len: 512  # allows for 4 images of 4096 tokens each
     load_async: true
     n_views: 2
     add_bos: false

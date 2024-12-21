@@ -1,4 +1,4 @@
-dump_dir: ./mst_text_image_experiment
+dump_dir: ./mst_text_image_experiment_1
 name: "mst_text_image_training"
 steps: 50000
 

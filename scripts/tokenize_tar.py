@@ -93,6 +93,7 @@ with open(output_path, 'w') as f_out:
         # Verify token range
         for token_list in codes:
             assert all(0 <= t < vocab_size for t in token_list), "Token out of range!"
+            assert len(token_list) == 4096, "Token length mismatch!"
 
         # Write results to jsonl
         for filename, token_list in zip(filenames, codes):
